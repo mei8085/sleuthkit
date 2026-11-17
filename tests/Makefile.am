@@ -9,12 +9,17 @@ check_SCRIPTS = runtests.sh test_libraries.sh
 
 TESTS = runtests.sh test_libraries.sh
 
-check_PROGRAMS = read_apis fs_fname_apis fs_attrlist_apis fs_thread_test
+check_PROGRAMS = read_apis fs_fname_apis fs_attrlist_apis fs_thread_test fs_fuzz_harness_test
 
 read_apis_SOURCES = read_apis.cpp
 fs_fname_apis_SOURCES = fs_fname_apis.cpp
 fs_attrlist_apis_SOURCES = fs_attrlist_apis.cpp
 fs_thread_test_SOURCES = fs_thread_test.cpp tsk_thread.cpp tsk_thread.h
+fs_fuzz_harness_test_SOURCES = fs_fuzz_harness_test.cpp
+
+# fs_fuzz_harness_test builds all of its images in memory and needs no
+# external image directory, so it can run as a plain check test.
+TESTS += fs_fuzz_harness_test
 
 MAINTAINERCLEANFILES = Makefile.in
 
