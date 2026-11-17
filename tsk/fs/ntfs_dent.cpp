@@ -347,13 +347,24 @@ ntfs_dent_copy_short_only(NTFS_INFO * ntfs, ntfs_idxentry * idxe,
 
 /* This is a sanity check to see if the time is valid
  * it is divided by 100 to keep it in a 32-bit integer
+ *
+ * The lower bound is 1970 because NTFS times before that cannot be
+ * represented as UNIX times (nt2unixtime() maps them to 0).  The
+ * upper bound is the current time plus a small allowance for clock
+ * skew -- a hardcoded year would go stale and wrongly filter out
+ * valid entries from index slack as time marches on.
  */
 
 static uint8_t
 is_time(uint64_t t)
 {
 #define SEC_BTWN_1601_1970_DIV100 ((369*365 + 89) * 24 * 36)
-#define SEC_BTWN_1601_2020_DIV100 (SEC_BTWN_1601_1970_DIV100 + (50*365 + 6) * 24 * 36)
+/* Allow times slightly in the future to account for clock skew
+ * between the imaged system and the analysis system (2 days,
+ * in units of 100 seconds) */
+#define SEC_FUTURE_SKEW_DIV100 (2 * 24 * 36)
+
+    uint64_t now_div100;
 
     t /= 1000000000;            /* put the time in seconds div by additional 100 */
 
@@ -363,7 +374,9 @@ is_time(uint64_t t)
     if (t < SEC_BTWN_1601_1970_DIV100)
         return 0;
 
-    if (t > SEC_BTWN_1601_2020_DIV100)
+    /* reject times unreasonably far in the future */
+    now_div100 = ((uint64_t) time(NULL)) / 100 + SEC_BTWN_1601_1970_DIV100;
+    if (t > now_div100 + SEC_FUTURE_SKEW_DIV100)
         return 0;
 
     return 1;
