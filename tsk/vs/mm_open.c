@@ -145,6 +145,22 @@ tsk_vs_open(TSK_IMG_INFO * img_info, TSK_DADDR_T offset,
             }
         }
         else {
+            /* A GPT was found but failed its CRC / primary-backup
+             * consistency checks.  This is a tampering or corruption
+             * signal, not an ordinary "not a GPT" probe miss: the disk does
+             * carry GPT structures (typically plus a protective MBR that
+             * DOS would otherwise accept).  Report it explicitly and refuse
+             * to fall back to another parser that would hand back
+             * unmarked, uncertified partitions.  Other GPT open errors are
+             * probe failures and are cleared as before. */
+            if ((tsk_error_get_errno() & 0xFFFF) ==
+                (TSK_ERR_VS_CRC & 0xFFFF)) {
+                if (prev_vs != NULL) {
+                    prev_vs->close(prev_vs);
+                    prev_vs = NULL;
+                }
+                return NULL;
+            }
             tsk_error_reset();
         }
 

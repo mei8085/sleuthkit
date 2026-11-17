@@ -59,6 +59,7 @@ static const char *tsk_err_mm_str[TSK_ERR_VS_MAX] = {
     "Invalid API argument",
     "Encryption detected",
     "Multiple volume system types detected",
+    "CRC/checksum mismatch or partition table inconsistency",
 };
 
 static const char *tsk_err_fs_str[TSK_ERR_FS_MAX] = {

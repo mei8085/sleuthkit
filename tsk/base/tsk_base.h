@@ -337,7 +337,8 @@ typedef void(*TSK_ERROR_LISTENER_CB) (unsigned int err_code, const char* errmsg)
 #define TSK_ERR_VS_ARG	    (TSK_ERR_VS | 7)
 #define TSK_ERR_VS_ENCRYPTED    (TSK_ERR_VS | 8)
 #define TSK_ERR_VS_MULTTYPE     (TSK_ERR_VS | 9)
-#define TSK_ERR_VS_MAX		10
+#define TSK_ERR_VS_CRC          (TSK_ERR_VS | 10)   ///< Checksum/CRC mismatch or primary/backup table inconsistency
+#define TSK_ERR_VS_MAX		11
 
 #define TSK_ERR_POOL_UNKTYPE    (TSK_ERR_POOL | 0)
 #define TSK_ERR_POOL_UNSUPTYPE  (TSK_ERR_POOL | 1)

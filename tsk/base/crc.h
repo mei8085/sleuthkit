@@ -98,6 +98,11 @@ typedef unsigned char * p_ubyte_;
 #include <stdbool.h>
 #endif
 
+#include <stddef.h>
+#ifndef _MSC_VER
+#include <stdint.h>
+#endif
+
 #ifndef TRUE
 #define FALSE 0
 #define TRUE  1
@@ -169,6 +174,19 @@ ulong cm_tab P_((p_cm_t p_cm,int index));
 /* End of the header file idempotence #ifndef */
 
 void crc16(p_cm_t crc_context, unsigned char const *buff, unsigned int size);
+
+/*
+ * CRC32 as defined by the UEFI specification and used by GPT headers and
+ * partition entry arrays: polynomial 0x04C11DB7, reflected in/out,
+ * initial value and final XOR of 0xFFFFFFFF (equivalent to the zlib
+ * crc32() with init value 0).
+ *
+ * @param crc  Running CRC (pass 0 to start a new computation).
+ * @param buf  Data bytes to fold into the CRC.
+ * @param len  Number of bytes in buf.
+ * @returns Updated CRC.
+ */
+uint32_t tsk_crc32_uefi(uint32_t crc, const unsigned char *buf, size_t len);
 
 #endif
 

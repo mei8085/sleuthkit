@@ -139,7 +139,44 @@ void crc16(p_cm_t crc_context, unsigned char const *buff, unsigned int size)
     {
         cm_nxt(crc_context, *buff++);
         size--;
-    }   
+    }
+}
+
+/*
+ * UEFI/GPT CRC32 (same polynomial and reflection as zlib crc32).
+ * Lookup table is built lazily on first use.
+ */
+static uint32_t tsk_crc32_uefi_table[256];
+static int tsk_crc32_uefi_table_ready = 0;
+
+static void
+tsk_crc32_uefi_init(void)
+{
+    uint32_t i;
+    for (i = 0; i < 256; i++) {
+        uint32_t c = i;
+        int k;
+        for (k = 0; k < 8; k++) {
+            if (c & 1)
+                c = 0xEDB88320U ^ (c >> 1);
+            else
+                c = c >> 1;
+        }
+        tsk_crc32_uefi_table[i] = c;
+    }
+    tsk_crc32_uefi_table_ready = 1;
+}
+
+uint32_t
+tsk_crc32_uefi(uint32_t crc, const unsigned char *buf, size_t len)
+{
+    if (!tsk_crc32_uefi_table_ready)
+        tsk_crc32_uefi_init();
+
+    crc = crc ^ 0xFFFFFFFFU;
+    while (len--)
+        crc = tsk_crc32_uefi_table[(crc ^ *buf++) & 0xFFU] ^ (crc >> 8);
+    return crc ^ 0xFFFFFFFFU;
 }
 
 
