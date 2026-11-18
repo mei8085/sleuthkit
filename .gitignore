@@ -1,5 +1,9 @@
 # NetBeans user-specific settings
 /bindings/java/nbproject/private/
+
+# Locally extracted build/test dependencies (cppunit, autotools)
+/.localdeps
+/.localinstall/
  
 # Bindings dependecies and build folders
 /bindings/java/lib/
@@ -185,6 +189,9 @@ tools/*/*/*.exe
 unit_tests/base/*.log
 unit_tests/base/*.trs
 unit_tests/base/test_base
+unit_tests/vs/*.log
+unit_tests/vs/*.trs
+unit_tests/vs/test_vs_partition
 # EMACS backup files
 *~
 

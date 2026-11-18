@@ -114,6 +114,82 @@ tsk_vs_part_add(TSK_VS_INFO * a_vs, TSK_DADDR_T a_start, TSK_DADDR_T len,
 }
 
 /**
+ * Validate the sector bounds of a partition table entry before it is
+ * inserted into the sorted partition list.  The checks run while the
+ * table is being parsed, so a malformed entry is rejected before any
+ * "Unallocated" gap (see tsk_vs_part_unused()) can be derived from it
+ * and before any sector outside the image can be read through it.
+ *
+ * The structured error string always carries three anchors:
+ *   - the partition table slot (table/slot)
+ *   - the raw starting and ending sectors (start, start+len)
+ *   - a failure category keyword (zero-length / beyond-end / overlap)
+ *
+ * @param a_vs Volume system that the entry would belong to.
+ * @param a_start Raw starting sector as stored in the table.
+ * @param a_len Raw sector count as stored in the table.
+ * @param a_table Table number the entry came from (-1 when unused).
+ * @param a_slot Slot number of the entry in that table.
+ * @returns 0 if the entry is usable, 1 if it is malformed (tsk_errno set).
+ */
+uint8_t
+tsk_vs_part_entry_validate(const TSK_VS_INFO * a_vs, TSK_DADDR_T a_start,
+    TSK_DADDR_T a_len, int a_table, int a_slot)
+{
+    const TSK_DADDR_T max_addr =
+        (a_vs->img_info->size - a_vs->offset) / a_vs->block_size;
+    const TSK_VS_PART_INFO *part;
+
+    /* Zero-length entries describe no sectors and cannot produce a
+     * valid half-open [start, start+len) interval. */
+    if (a_len == 0) {
+        tsk_error_reset();
+        tsk_error_set_errno(TSK_ERR_VS_BLK_NUM);
+        tsk_error_set_errstr
+            ("tsk_vs_part_entry_validate: zero-length partition entry"
+            " (table %d slot %d: start %" PRIuDADDR " end %" PRIuDADDR
+            ")", a_table, a_slot, a_start, a_start);
+        return 1;
+    }
+
+    /* Entries must stay inside the image: the half-open interval ends
+     * at start+len and the last valid sector is max_addr-1. */
+    if ((a_start >= max_addr) || (a_start + a_len > max_addr)) {
+        tsk_error_reset();
+        tsk_error_set_errno(TSK_ERR_VS_BLK_NUM);
+        tsk_error_set_errstr
+            ("tsk_vs_part_entry_validate: partition beyond end of image"
+            " (table %d slot %d: start %" PRIuDADDR " end %" PRIuDADDR
+            ", image sectors %" PRIuDADDR ")", a_table, a_slot, a_start,
+            a_start + a_len, max_addr);
+        return 1;
+    }
+
+    /* Allocated partitions must not overlap each other.  META entries
+     * (table sectors, extended containers, GPT metadata) legitimately
+     * share sectors with other metadata, so they are excluded here. */
+    for (part = a_vs->part_list; part != NULL; part = part->next) {
+        if (part->flags & TSK_VS_PART_FLAG_META)
+            continue;
+        if ((a_start < part->start + part->len)
+            && (part->start < a_start + a_len)) {
+            tsk_error_reset();
+            tsk_error_set_errno(TSK_ERR_VS_BLK_NUM);
+            tsk_error_set_errstr
+                ("tsk_vs_part_entry_validate: overlapping partition"
+                " entry (table %d slot %d: start %" PRIuDADDR " end %"
+                PRIuDADDR " overlaps slot %d start %" PRIuDADDR
+                " end %" PRIuDADDR ")", a_table, a_slot, a_start,
+                a_start + a_len, part->slot_num, part->start,
+                part->start + part->len);
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/**
  * Identify regions in the partition list where there are unused sectors
  * and create new entries for them.
  *

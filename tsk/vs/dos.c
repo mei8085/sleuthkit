@@ -826,13 +826,25 @@ dos_load_ext_table(TSK_VS_INFO * vs, TSK_DADDR_T sect_cur,
             // we ignore the max_addr checks on extended partitions...
 
             {
+                TSK_DADDR_T log_start =
+                    (TSK_DADDR_T) (sect_cur + part_start);
+
+                if (tsk_vs_part_entry_validate(vs, log_start,
+                        (TSK_DADDR_T) part_size, table, i)) {
+                    tsk_error_set_errstr2
+                        ("dos_load_ext_table: malformed entry %d in table sector %"
+                        PRIuDADDR, i, sect_cur);
+                    free(sect_buf);
+                    return 1;
+                }
+
                 char *desc = dos_get_desc(part->ptype);
                 if (desc == NULL) {
                     free(sect_buf);
                     return 1;
                 }
                 if (NULL == tsk_vs_part_add(vs,
-                        (TSK_DADDR_T) (sect_cur + part_start),
+                        log_start,
                         (TSK_DADDR_T) part_size, TSK_VS_PART_FLAG_ALLOC,
                         desc, table, i)) {
                     free(desc);
@@ -990,8 +1002,24 @@ dos_load_prim_table(TSK_VS_INFO * vs, uint8_t test)
                 "load_pri:0:%d    Start: %" PRIu32 "   Size: %" PRIu32
                 "  Type: %d\n", i, part_start, part_size, part->ptype);
 
-        if (part_size == 0)
+        if (part_size == 0) {
+            /* A typed entry with no sectors is malformed; a fully empty
+             * slot (type 0, start 0) is simply unused. */
+            if (part->ptype != 0 || part_start != 0) {
+                tsk_error_reset();
+                tsk_error_set_errno(TSK_ERR_VS_BLK_NUM);
+                tsk_error_set_errstr
+                    ("tsk_vs_part_entry_validate: zero-length partition entry"
+                    " (table 0 slot %d: start %" PRIu32 " end %" PRIu32
+                    ")", i, part_start, part_start);
+                tsk_error_set_errstr2
+                    ("dos_load_prim_table: malformed entry %d in primary table sector %"
+                    PRIuDADDR, i, taddr);
+                free(sect_buf);
+                return 1;
+            }
             continue;
+        }
 
         // make sure the first couple are in the image bounds
         if ((i < 2) && (part_start > max_addr)) {
@@ -1047,6 +1075,14 @@ dos_load_prim_table(TSK_VS_INFO * vs, uint8_t test)
             }
         }
         else {
+            if (tsk_vs_part_entry_validate(vs, (TSK_DADDR_T) part_start,
+                    (TSK_DADDR_T) part_size, 0, i)) {
+                tsk_error_set_errstr2
+                    ("dos_load_prim_table: malformed entry %d in primary table sector %"
+                    PRIuDADDR, i, taddr);
+                free(sect_buf);
+                return 1;
+            }
             {
                 char *desc = dos_get_desc(part->ptype);
                 if (desc == NULL) {

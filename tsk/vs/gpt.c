@@ -251,6 +251,41 @@ gpt_load_table(TSK_VS_INFO * vs, GPT_LOCATION_ENUM gpt_type)
                 continue;
             }
 
+            {
+                TSK_DADDR_T ent_start =
+                    (TSK_DADDR_T) tsk_getu64(vs->endian,
+                    ent->start_lba);
+                TSK_DADDR_T ent_end =
+                    (TSK_DADDR_T) tsk_getu64(vs->endian, ent->end_lba);
+
+                /* end_lba is inclusive, so the sector count is end-start+1.
+                 * Reject zero-length entries, entries past the image and
+                 * overlapping entries before anything is added to the list,
+                 * so no truncated Unallocated region can be derived. */
+                if (ent_end < ent_start) {
+                    tsk_error_reset();
+                    tsk_error_set_errno(TSK_ERR_VS_BLK_NUM);
+                    tsk_error_set_errstr
+                        ("tsk_vs_part_entry_validate: zero-length partition entry"
+                        " (table -1 slot %u: start %" PRIuDADDR " end %"
+                        PRIuDADDR ")", i, ent_start, ent_end);
+                    tsk_error_set_errstr2
+                        ("gpt_load_table: malformed GPT entry %u", i);
+                    free(sect_buf);
+                    free(ent_buf);
+                    return 1;
+                }
+
+                if (tsk_vs_part_entry_validate(vs, ent_start,
+                        ent_end - ent_start + 1, -1, (int) i)) {
+                    tsk_error_set_errstr2
+                        ("gpt_load_table: malformed GPT entry %u", i);
+                    free(sect_buf);
+                    free(ent_buf);
+                    return 1;
+                }
+            }
+
             // make sure the first couple are in the image bounds
             if ((i < 2)
                 && (tsk_getu64(vs->endian, ent->start_lba) > max_addr)) {
@@ -315,6 +350,21 @@ gpt_close(TSK_VS_INFO * vs)
     free(vs);
 }
 
+/*
+ * A content error is a deterministic rejection of partition table data
+ * (bad block number, zero-length / overlapping / out-of-range entry)
+ * rather than a failed read or a magic/signature mismatch.  Reads and
+ * magics may be cured by retrying with another sector size or the
+ * secondary table, but retrying a content error cannot succeed and would
+ * only overwrite the structured, locatable error string.  Callers use
+ * this to short-circuit the fallback chain while preserving the error.
+ */
+static int
+gpt_is_content_error()
+{
+    return tsk_error_get_errno() == TSK_ERR_VS_BLK_NUM;
+}
+
 TSK_VS_INFO *
 tsk_vs_gpt_open(TSK_IMG_INFO * img_info, TSK_DADDR_T offset)
 {
@@ -353,6 +403,12 @@ tsk_vs_gpt_open(TSK_IMG_INFO * img_info, TSK_DADDR_T offset)
 
     /* Load the partitions into the sorted list */
     if (gpt_load_table(vs, PRIMARY_TABLE)) {
+        /* Deterministic content rejection: keep the structured error and
+         * do not obscure it with sector-size / secondary retries. */
+        if (gpt_is_content_error()) {
+            gpt_close(vs);
+            return NULL;
+        }
         tsk_vs_part_free(vs);
         int found = 0;
         if (tsk_verbose)
@@ -366,6 +422,10 @@ tsk_vs_gpt_open(TSK_IMG_INFO * img_info, TSK_DADDR_T offset)
                     vs->block_size);
 
             if (gpt_load_table(vs, PRIMARY_TABLE)) {
+                if (gpt_is_content_error()) {
+                    gpt_close(vs);
+                    return NULL;
+                }
                 tsk_vs_part_free(vs);
                 vs->block_size *= 2;
                 continue;
@@ -381,6 +441,10 @@ tsk_vs_gpt_open(TSK_IMG_INFO * img_info, TSK_DADDR_T offset)
             vs->block_size = img_info->sector_size;
             vs->is_backup = 1;
             if(gpt_load_table(vs, SECONDARY_TABLE)){
+                if (gpt_is_content_error()) {
+                    gpt_close(vs);
+                    return NULL;
+                }
 
                 /* Try other sector sizes again */
                 tsk_vs_part_free(vs);
@@ -391,6 +455,10 @@ tsk_vs_gpt_open(TSK_IMG_INFO * img_info, TSK_DADDR_T offset)
                             vs->block_size);
 
                     if (gpt_load_table(vs, SECONDARY_TABLE)) {
+                        if (gpt_is_content_error()) {
+                            gpt_close(vs);
+                            return NULL;
+                        }
                         tsk_vs_part_free(vs);
                         vs->block_size *= 2;
                         continue;
