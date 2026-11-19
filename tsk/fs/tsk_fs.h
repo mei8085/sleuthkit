@@ -615,6 +615,11 @@ extern "C" {
 
         TSK_FS_NAME_TYPE_ENUM type;     ///< File type information (directory, file, etc.)
         TSK_FS_NAME_FLAG_ENUM flags;    ///< Flags that describe allocation status etc.
+        uint32_t fs_specific_flags;     ///< File system-specific status bits. Currently only exFAT uses this field, to store the EXFATFS_DENTRY_SET_STATUS_ENUM of the directory entry set that produced the name (see tsk_exfatfs.h). 0 (EXFATFS_DENTRY_SET_STATUS_NOT_APPLICABLE) for all other file systems.
+        TSK_INUM_T fs_specific_meta_addr;  ///< File system-specific companion metadata address. exFAT: inode address of the stream extension entry of the directory entry set (0 if the name did not come from a file directory entry set).
+        TSK_INUM_T fs_specific_meta_addr2; ///< File system-specific second companion metadata address. exFAT: inode address of the first file name entry of the directory entry set (0 if there was none).
+        uint8_t fs_specific_count;      ///< File system-specific companion count. exFAT: number of file name entries that make up the name of the set.
+        uint8_t reserved_fs_specific[3]; ///< \internal Reserved so the layout stays aligned.
     } TSK_FS_NAME;
 
 
@@ -1389,6 +1394,34 @@ class TskFsName {
             return m_fsName->flags;
         else
             return (TSK_FS_NAME_FLAG_ENUM) 0;
+    };
+
+    /**
+        * Return the file system-specific status flags of the name. For exFAT
+        * this is the EXFATFS_DENTRY_SET_STATUS_ENUM of the directory entry
+        * set that produced the name (see tsk_exfatfs.h); it is 0
+        * (EXFATFS_DENTRY_SET_STATUS_NOT_APPLICABLE) for names that did not
+        * come from an exFAT file directory entry set.
+    * @return file system-specific status flags
+    */
+    uint32_t getFsSpecificFlags() const {
+        if (m_fsName != NULL)
+            return m_fsName->fs_specific_flags;
+        else
+            return 0;
+    };
+
+    /**
+        * Return the file system-specific companion metadata address of the
+        * name. For exFAT this is the inode address of the stream extension
+        * entry of the directory entry set; 0 if there was none.
+    * @return file system-specific companion metadata address
+    */
+    TSK_INUM_T getFsSpecificMetaAddr() const {
+        if (m_fsName != NULL)
+            return m_fsName->fs_specific_meta_addr;
+        else
+            return 0;
     };
 };
 

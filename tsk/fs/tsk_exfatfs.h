@@ -64,6 +64,14 @@
 
 /**
  * \internal
+ * The maximum number of directory entries in a file directory entry set,
+ * counting the primary file directory entry.
+ */
+#define EXFATFS_MAX_FILE_DENTRY_SET_ENTRIES \
+    (EXFATFS_MAX_FILE_SECONDARY_DENTRIES_COUNT + 1)
+
+/**
+ * \internal
  * An exFAT file name directory entry includes from 1 to 15 UTF-16 characters.
  * Each character is stored in UTF-16, so the buffer is actually 30-bytes.
  */
@@ -317,8 +325,92 @@ extern "C" {
         uint8_t utf16_name_chars[30];  ///< UTF16 part of file name, max 15 characters
     } EXFATFS_FILE_NAME_DIR_ENTRY;
 
-    extern uint8_t 
+    /**
+     * \internal
+     * The verification status of an exFAT file directory entry set. A file
+     * directory entry set is only considered trustworthy when all of the
+     * secondary entries declared by the primary entry are present in order
+     * and the check sum stored in the primary entry matches a check sum
+     * calculated over the whole set.
+     */
+    typedef enum {
+        EXFATFS_DENTRY_SET_STATUS_NOT_APPLICABLE = 0,   ///< The entry is not part of a file directory entry set
+        EXFATFS_DENTRY_SET_STATUS_UNKNOWN_SOURCE = 1,   ///< The provenance of the set could not be confirmed (no usable primary entry, or a deleted set that failed verification)
+        EXFATFS_DENTRY_SET_STATUS_COMPLETE = 2,         ///< All declared entries are present, in order, and the check sum matches
+        EXFATFS_DENTRY_SET_STATUS_CHECKSUM_MISMATCH = 3, ///< All declared entries are present and in order, but the check sum does not match
+        EXFATFS_DENTRY_SET_STATUS_SEQUENCE_ERROR = 4,   ///< One or more declared secondary entries are missing, out of order, or of the wrong type
+        EXFATFS_DENTRY_SET_STATUS_DELETED_RECOVERABLE = 5 ///< A deleted (cleaned) set that is complete and whose check sum matches
+    } EXFATFS_DENTRY_SET_STATUS_ENUM;
+
+    /**
+     * \internal
+     * Collects the raw directory entries that make up an exFAT file
+     * directory entry set together with the evidence needed to decide whether
+     * the set can be trusted: the primary, stream, and name entry addresses,
+     * the stored and calculated check sums, and the declared and available
+     * name lengths. The entries are copied, so the object remains valid after
+     * the directory buffer that contained them is released.
+     */
+    typedef struct {
+        FATFS_INFO *fatfs;              ///< The file system the set was read from
+        TSK_INUM_T primary_inum;        ///< Inode address of the primary (file) entry
+        TSK_INUM_T stream_inum;         ///< Inode address of the stream extension entry
+        TSK_INUM_T first_name_inum;     ///< Inode address of the first file name entry
+        TSK_INUM_T last_inum;           ///< Inode address of the last entry collected
+        uint16_t stored_check_sum;      ///< Check sum stored in the primary entry
+        uint16_t calculated_check_sum;  ///< Check sum calculated over the collected entries
+        uint8_t primary_entry_is_present:1; ///< A primary file entry was collected
+        uint8_t stream_entry_is_present:1;  ///< A stream extension entry was collected
+        uint8_t is_deleted:1;           ///< The in-use bit of the primary entry is clear
+        uint8_t primary_sector_is_alloc:1;  ///< The sector that held the primary entry was allocated
+        uint8_t stored_secondary_entry_count; ///< Secondary entry count declared by the primary entry
+        uint8_t entries_count;          ///< Number of entries collected (including the primary)
+        uint8_t name_entries_count;     ///< Number of file name entries collected
+        uint8_t declared_name_length_utf16_chars; ///< Name length declared by the stream entry
+        EXFATFS_DENTRY_SET_STATUS_ENUM status; ///< Verification status of the set
+        FATFS_DENTRY entries[EXFATFS_MAX_FILE_DENTRY_SET_ENTRIES]; ///< Raw entries, in directory order
+    } EXFATFS_DENTRY_SET;
+
+    /**
+     * \internal
+     * The exFAT-specific contents of the TSK_FS_META::content_ptr buffer for a
+     * file inode. The first member must remain the address of the first
+     * cluster because the generic FAT code reads it from there.
+     */
+    typedef struct {
+        TSK_DADDR_T first_cluster;      ///< Address of the first cluster of the file data
+        EXFATFS_DENTRY_SET_STATUS_ENUM dentry_set_status; ///< Verification status of the file directory entry set
+        TSK_INUM_T primary_inum;        ///< Inode address of the primary file entry
+        TSK_INUM_T stream_inum;         ///< Inode address of the stream extension entry (0 if absent)
+        TSK_INUM_T first_name_inum;     ///< Inode address of the first file name entry (0 if absent)
+        TSK_INUM_T last_inum;           ///< Inode address of the last entry of the set
+        uint16_t stored_check_sum;      ///< Check sum stored in the primary entry
+        uint16_t calculated_check_sum;  ///< Check sum calculated over the set
+        uint8_t declared_secondary_entry_count; ///< Secondary entry count declared by the primary entry
+        uint8_t actual_secondary_entry_count;   ///< Secondary entries found
+        uint8_t declared_name_length_utf16_chars; ///< Name length declared by the stream entry
+        uint8_t is_deleted;             ///< The in-use bit of the primary entry is clear
+        uint8_t entries_count;          ///< Number of entries that make up the set
+    } EXFATFS_META_CONTENT;
+
+    /**
+     * \internal
+     * Size of the exFAT-specific portion of TSK_FS_META::content_ptr.
+     */
+#define EXFATFS_FILE_CONTENT_LEN sizeof(EXFATFS_META_CONTENT)
+
+    extern uint8_t
     exfatfs_open(FATFS_INFO *a_fatfs);
+
+    extern uint16_t
+    exfatfs_calc_dentry_set_checksum(const FATFS_DENTRY *a_entries,
+        uint8_t a_entry_count, uint8_t a_restore_in_use_bits);
+
+    extern void
+    exfatfs_finalize_dentry_set(EXFATFS_DENTRY_SET *a_set, uint8_t a_sequence_ok);
+
+    extern const char *
+    exfatfs_dentry_set_status_to_str(EXFATFS_DENTRY_SET_STATUS_ENUM a_status);
 
     extern int8_t 
     exfatfs_is_cluster_alloc(FATFS_INFO *a_fatfs, TSK_DADDR_T a_cluster_addr);

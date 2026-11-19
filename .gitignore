@@ -185,6 +185,9 @@ tools/*/*/*.exe
 unit_tests/base/*.log
 unit_tests/base/*.trs
 unit_tests/base/test_base
+unit_tests/exfat/*.log
+unit_tests/exfat/*.trs
+unit_tests/exfat/test_exfat_dentry_set
 # EMACS backup files
 *~
 

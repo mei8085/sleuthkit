@@ -695,8 +695,193 @@ exfatfs_is_dentry(FATFS_INFO *a_fatfs, FATFS_DENTRY *a_dentry, FATFS_DATA_UNIT_A
 
 /**
  * \internal
- * Construct a single, non-resident data run for the TSK_FS_META object of a 
- * TSK_FS_FILE object.  
+ * Add one byte to an exFAT directory entry check sum. The algorithm is the
+ * one described in the exFAT specification: rotate the current sum right by
+ * one bit and add the byte.
+ *
+ * @param [in] a_check_sum The sum so far.
+ * @param [in] a_byte The byte to add.
+ * @return The updated sum.
+ */
+static uint16_t
+exfatfs_add_checksum_byte(uint16_t a_check_sum, uint8_t a_byte)
+{
+    return (uint16_t)(((a_check_sum << 15) | (a_check_sum >> 1)) + a_byte);
+}
+
+/**
+ * \internal
+ * Calculate the check sum of an exFAT file directory entry set. The check sum
+ * stored in the primary file directory entry covers every byte of every entry
+ * of the set except for the two bytes of the check sum field itself. When
+ * a_restore_in_use_bits is set, the in-use bit (0x80) of the type byte of
+ * every entry is set before the byte is added. This allows the check sum of a
+ * deleted entry set, whose in-use bits were cleared when the set was cleaned,
+ * to be tested against the value stored before deletion.
+ *
+ * @param [in] a_entries The raw directory entries, in directory order.
+ * @param [in] a_entry_count The number of entries in the array.
+ * @param [in] a_restore_in_use_bits Non-zero to set the in-use bit of every
+ * entry's type byte before adding it.
+ * @return The calculated check sum.
+ */
+uint16_t
+exfatfs_calc_dentry_set_checksum(const FATFS_DENTRY *a_entries,
+    uint8_t a_entry_count, uint8_t a_restore_in_use_bits)
+{
+    uint16_t check_sum = 0;
+    uint8_t entry_index = 0;
+    uint8_t byte_index = 0;
+
+    if (a_entries == NULL) {
+        return 0;
+    }
+
+    for (entry_index = 0; entry_index < a_entry_count; ++entry_index) {
+        const uint8_t *bytes = a_entries[entry_index].data;
+
+        for (byte_index = 0; byte_index < FATFS_DENTRY_SIZE; ++byte_index) {
+            uint8_t byte_value = 0;
+
+            /* The check sum field of the primary entry is not covered. */
+            if ((entry_index == 0) && ((byte_index == 2) || (byte_index == 3))) {
+                continue;
+            }
+
+            byte_value = bytes[byte_index];
+            if ((byte_index == 0) && a_restore_in_use_bits) {
+                byte_value |= 0x80;
+            }
+            check_sum = exfatfs_add_checksum_byte(check_sum, byte_value);
+        }
+    }
+
+    return check_sum;
+}
+
+/**
+ * \internal
+ * Return a human-readable string for a directory entry set verification
+ * status.
+ *
+ * @param [in] a_status The status.
+ * @return A static string.
+ */
+const char *
+exfatfs_dentry_set_status_to_str(EXFATFS_DENTRY_SET_STATUS_ENUM a_status)
+{
+    switch (a_status) {
+        case EXFATFS_DENTRY_SET_STATUS_NOT_APPLICABLE:
+            return "not part of an entry set";
+        case EXFATFS_DENTRY_SET_STATUS_UNKNOWN_SOURCE:
+            return "unconfirmed source";
+        case EXFATFS_DENTRY_SET_STATUS_COMPLETE:
+            return "complete and verified";
+        case EXFATFS_DENTRY_SET_STATUS_CHECKSUM_MISMATCH:
+            return "check sum mismatch";
+        case EXFATFS_DENTRY_SET_STATUS_SEQUENCE_ERROR:
+            return "sequence error (missing or out of order entries)";
+        case EXFATFS_DENTRY_SET_STATUS_DELETED_RECOVERABLE:
+            return "deleted but recoverable (check sum verified)";
+        default:
+            return "unknown";
+    }
+}
+
+/**
+ * \internal
+ * Compute the verification status of a collected exFAT file directory entry
+ * set. The caller must already have collected the entries in directory order
+ * and set the primary entry, in-use, and declared secondary entry count
+ * members. a_sequence_ok reports whether all of the secondary entries
+ * declared by the primary entry were found, in order and with the expected
+ * types.
+ *
+ * @param [in, out] a_set The set to finalize.
+ * @param [in] a_sequence_ok Non-zero if the declared entries were collected
+ * in order.
+ */
+void
+exfatfs_finalize_dentry_set(EXFATFS_DENTRY_SET *a_set, uint8_t a_sequence_ok)
+{
+    EXFATFS_FILE_STREAM_DIR_ENTRY *stream_dentry = NULL;
+
+    assert(a_set != NULL);
+
+    a_set->calculated_check_sum = 0;
+    a_set->name_entries_count = 0;
+    a_set->declared_name_length_utf16_chars = 0;
+
+    if (!a_set->primary_entry_is_present) {
+        a_set->status = EXFATFS_DENTRY_SET_STATUS_UNKNOWN_SOURCE;
+        return;
+    }
+
+    /* Count the file name entries and pick up the declared name length. The
+     * stream entry is always the first secondary entry when it is present. */
+    if (a_set->stream_entry_is_present && (a_set->entries_count > 1)) {
+        stream_dentry = (EXFATFS_FILE_STREAM_DIR_ENTRY*)&a_set->entries[1];
+        /* The field is a single byte, so it can never exceed the maximum
+         * name length. */
+        a_set->declared_name_length_utf16_chars =
+            stream_dentry->file_name_length_UTF16_chars;
+        if (a_set->entries_count > 2) {
+            a_set->name_entries_count = a_set->entries_count - 2;
+        }
+    }
+
+    /* A set whose declared secondary entries were not all collected in order
+     * cannot be trusted. The entries that follow it must not be associated
+     * with it. The same applies when the file name entries cannot supply the
+     * number of characters declared by the stream entry, or when no name was
+     * declared at all. */
+    if (!a_sequence_ok || !a_set->stream_entry_is_present ||
+        (a_set->entries_count != (uint8_t)(a_set->stored_secondary_entry_count + 1)) ||
+        (a_set->declared_name_length_utf16_chars == 0) ||
+        ((uint16_t)a_set->name_entries_count *
+            EXFATFS_MAX_FILE_NAME_SEGMENT_LENGTH_UTF16_CHARS <
+            a_set->declared_name_length_utf16_chars)) {
+        a_set->status = EXFATFS_DENTRY_SET_STATUS_SEQUENCE_ERROR;
+        return;
+    }
+
+    if (!a_set->is_deleted) {
+        a_set->calculated_check_sum =
+            exfatfs_calc_dentry_set_checksum(a_set->entries, a_set->entries_count, 0);
+        a_set->status = (a_set->calculated_check_sum == a_set->stored_check_sum) ?
+            EXFATFS_DENTRY_SET_STATUS_COMPLETE :
+            EXFATFS_DENTRY_SET_STATUS_CHECKSUM_MISMATCH;
+        return;
+    }
+
+    /* The set was cleaned: the in-use bits of all of the entries may have
+     * been cleared, but the check sum stored in the primary entry is the one
+     * calculated before deletion. Test both the bytes as they are on the
+     * media and the bytes with the in-use bits restored. */
+    a_set->calculated_check_sum =
+        exfatfs_calc_dentry_set_checksum(a_set->entries, a_set->entries_count, 0);
+    if (a_set->calculated_check_sum == a_set->stored_check_sum) {
+        a_set->status = EXFATFS_DENTRY_SET_STATUS_DELETED_RECOVERABLE;
+        return;
+    }
+
+    a_set->calculated_check_sum =
+        exfatfs_calc_dentry_set_checksum(a_set->entries, a_set->entries_count, 1);
+    if (a_set->calculated_check_sum == a_set->stored_check_sum) {
+        a_set->status = EXFATFS_DENTRY_SET_STATUS_DELETED_RECOVERABLE;
+        return;
+    }
+
+    /* A cleaned set whose check sum cannot be confirmed has no trustworthy
+     * source: whatever name, length, or times it appears to carry may be
+     * stale or overwritten, so it cannot be reported as recovered. */
+    a_set->status = EXFATFS_DENTRY_SET_STATUS_UNKNOWN_SOURCE;
+}
+
+/**
+ * \internal
+ * Construct a single, non-resident data run for the TSK_FS_META object of a
+ * TSK_FS_FILE object.
  *
  * @param [in, out] a_fs_file Generic file with generic inode structure (TSK_FS_META).
  * @return 0 on success, 1 on failure, per TSK convention
@@ -1083,35 +1268,187 @@ exfatfs_next_dentry_inum(FATFS_INFO *a_fatfs, TSK_INUM_T a_current_entry_inum,
 
 /**
  * \internal
- * Use a a file and a file stream directory entry corresponding to the exFAT 
- * equivalent of an inode to populate the TSK_FS_META object of a TSK_FS_FILE 
+ * Return a pointer to the exFAT-specific contents of the TSK_FS_META of a
+ * file inode, growing the content buffer if necessary.
+ *
+ * @param [in] a_fs_file The file whose metadata is to be updated.
+ * @return The content structure, or NULL on error.
+ */
+static EXFATFS_META_CONTENT *
+exfatfs_meta_content(TSK_FS_FILE *a_fs_file)
+{
+    TSK_FS_META *fs_meta = NULL;
+
+    assert(a_fs_file != NULL);
+    assert(a_fs_file->meta != NULL);
+
+    fs_meta = a_fs_file->meta;
+    if (fs_meta->content_len < EXFATFS_FILE_CONTENT_LEN) {
+        size_t old_len = fs_meta->content_len;
+        TSK_FS_META *tmp = tsk_fs_meta_realloc(fs_meta, EXFATFS_FILE_CONTENT_LEN);
+        if (tmp == NULL) {
+            return NULL;
+        }
+        fs_meta = tmp;
+        a_fs_file->meta = tmp;
+        /* tsk_fs_meta_realloc does not initialize the new bytes. */
+        memset((char*)fs_meta->content_ptr + old_len, 0,
+            EXFATFS_FILE_CONTENT_LEN - old_len);
+    }
+
+    return (EXFATFS_META_CONTENT*)fs_meta->content_ptr;
+}
+
+/**
+ * \internal
+ * Collect the directory entries of the exFAT file directory entry set that
+ * begins with a given file directory entry and verify the set. Entries are
+ * only collected while they continue the sequence declared by the primary
+ * entry and carry the same in-use state; a damaged or truncated set therefore
+ * ends where the sequence breaks and can never consume the entries of the
+ * next file.
+ *
+ * @param [in] a_fatfs Source file system for the directory entries.
+ * @param [in] a_primary_inum Inode address of the file (primary) entry.
+ * @param [in] a_file_dentry The file (primary) entry.
+ * @param [in] a_primary_sector_is_alloc Allocation status of the sector that
+ * contains the primary entry.
+ * @param [out] a_set The collected and verified set.
+ * @return 0 on success, 1 on failure, per TSK convention.
+ */
+static uint8_t
+exfatfs_collect_dentry_set(FATFS_INFO *a_fatfs, TSK_INUM_T a_primary_inum,
+    FATFS_DENTRY *a_file_dentry, uint8_t a_primary_sector_is_alloc,
+    EXFATFS_DENTRY_SET *a_set)
+{
+    EXFATFS_FILE_DIR_ENTRY *file_dentry = (EXFATFS_FILE_DIR_ENTRY*)a_file_dentry;
+    FATFS_DENTRY dentry;
+    TSK_INUM_T current_inum = 0;
+    TSK_INUM_T name_inum = 0;
+    uint8_t expected_entry_count = 0;
+    uint8_t sequence_ok = 1;
+
+    assert(a_fatfs != NULL);
+    assert(a_file_dentry != NULL);
+    assert(a_set != NULL);
+    assert(exfatfs_get_enum_from_type(file_dentry->entry_type) == EXFATFS_DIR_ENTRY_TYPE_FILE);
+
+    memset((void*)a_set, 0, sizeof(EXFATFS_DENTRY_SET));
+    a_set->fatfs = a_fatfs;
+    a_set->primary_entry_is_present = 1;
+    a_set->primary_inum = a_primary_inum;
+    a_set->last_inum = a_primary_inum;
+    a_set->primary_sector_is_alloc = a_primary_sector_is_alloc ? 1 : 0;
+    a_set->is_deleted =
+        (uint8_t)(exfatfs_get_alloc_status_from_type(file_dentry->entry_type) == 0);
+    a_set->stored_secondary_entry_count = file_dentry->secondary_entries_count;
+    a_set->stored_check_sum =
+        tsk_getu16(a_fatfs->fs_info.endian, file_dentry->check_sum);
+    memcpy(&a_set->entries[0], a_file_dentry, sizeof(FATFS_DENTRY));
+    a_set->entries_count = 1;
+
+    /* An out-of-range secondary entry count cannot describe a real set. */
+    if ((file_dentry->secondary_entries_count < EXFATFS_MIN_FILE_SECONDARY_DENTRIES_COUNT) ||
+        (file_dentry->secondary_entries_count > EXFATFS_MAX_FILE_SECONDARY_DENTRIES_COUNT)) {
+        exfatfs_finalize_dentry_set(a_set, 0);
+        return 0;
+    }
+
+    expected_entry_count = (uint8_t)(file_dentry->secondary_entries_count + 1);
+
+    /* Find the stream extension entry. It must follow the primary entry and
+     * carry the same in-use state. */
+    if (exfatfs_next_dentry_inum(a_fatfs, a_primary_inum, file_dentry,
+        EXFATFS_DIR_ENTRY_TYPE_FILE_STREAM, &current_inum) != FATFS_OK) {
+        exfatfs_finalize_dentry_set(a_set, 0);
+        return 0;
+    }
+
+    if ((exfatfs_load_file_stream_dentry(a_fatfs, current_inum,
+            a_primary_sector_is_alloc, file_dentry->entry_type, &dentry) != 0) ||
+        (exfatfs_get_enum_from_type(dentry.data[0]) != EXFATFS_DIR_ENTRY_TYPE_FILE_STREAM) ||
+        (exfatfs_get_alloc_status_from_type(dentry.data[0]) !=
+            exfatfs_get_alloc_status_from_type(file_dentry->entry_type))) {
+        exfatfs_finalize_dentry_set(a_set, 0);
+        return 0;
+    }
+
+    a_set->stream_entry_is_present = 1;
+    a_set->stream_inum = current_inum;
+    a_set->last_inum = current_inum;
+    memcpy(&a_set->entries[a_set->entries_count], &dentry, sizeof(FATFS_DENTRY));
+    ++a_set->entries_count;
+
+    /* Collect the declared file name entries, in order. */
+    while (a_set->entries_count < expected_entry_count) {
+        if (exfatfs_next_dentry_inum(a_fatfs, current_inum, file_dentry,
+            EXFATFS_DIR_ENTRY_TYPE_FILE_NAME, &name_inum) != FATFS_OK) {
+            sequence_ok = 0;
+            break;
+        }
+
+        memset((void*)&dentry, 0, sizeof(FATFS_DENTRY));
+        if (fatfs_dentry_load(a_fatfs, &dentry, name_inum) != 0) {
+            sequence_ok = 0;
+            break;
+        }
+
+        if ((exfatfs_get_enum_from_type(dentry.data[0]) != EXFATFS_DIR_ENTRY_TYPE_FILE_NAME) ||
+            (exfatfs_get_alloc_status_from_type(dentry.data[0]) !=
+                exfatfs_get_alloc_status_from_type(file_dentry->entry_type))) {
+            sequence_ok = 0;
+            break;
+        }
+
+        if (a_set->first_name_inum == 0) {
+            a_set->first_name_inum = name_inum;
+        }
+        a_set->last_inum = name_inum;
+        memcpy(&a_set->entries[a_set->entries_count], &dentry, sizeof(FATFS_DENTRY));
+        ++a_set->entries_count;
+        current_inum = name_inum;
+    }
+
+    exfatfs_finalize_dentry_set(a_set, sequence_ok);
+
+    return 0;
+}
+
+/**
+ * \internal
+ * Use a a file and a file stream directory entry corresponding to the exFAT
+ * equivalent of an inode to populate the TSK_FS_META object of a TSK_FS_FILE
  * object.
  *
+ * The file directory entry set that begins with the file entry is collected
+ * and verified before any of its fields are used. The verification status and
+ * the inode addresses of the entries of the set are stored in the exFAT part
+ * of the metadata content buffer, and reported by istat. The file size, name,
+ * and time stamps are only copied into the metadata when the set is complete
+ * and its check sum is verified (including the deleted-but-recoverable case).
+ * For any other set those values are not trusted, so they are left empty
+ * rather than guessed.
+ *
  * @param a_fatfs [in] Source file system for the directory entries.
- * @param [in] a_inum Address of the inode. 
+ * @param [in] a_inum Address of the inode.
  * @param [in] a_dentry A file directory entry.
  * @param [in] a_is_alloc Allocation status of the sector that contains the
  * file directory entry.
  * @param a_fs_file [in, out] Generic file with generic inode structure (TSK_FS_META).
- * @return TSK_RETVAL_ENUM.  
+ * @return TSK_RETVAL_ENUM.
  */
-static TSK_RETVAL_ENUM 
-exfatfs_copy_file_inode(FATFS_INFO *a_fatfs, TSK_INUM_T a_inum, 
+static TSK_RETVAL_ENUM
+exfatfs_copy_file_inode(FATFS_INFO *a_fatfs, TSK_INUM_T a_inum,
     FATFS_DENTRY *a_file_dentry, uint8_t a_is_alloc, TSK_FS_FILE *a_fs_file)
 {
     TSK_FS_INFO *fs = NULL;
     TSK_FS_META *fs_meta =  NULL;
     EXFATFS_FILE_DIR_ENTRY *file_dentry = (EXFATFS_FILE_DIR_ENTRY*)a_file_dentry;
-    EXFATFS_FILE_STREAM_DIR_ENTRY stream_dentry;
+    EXFATFS_FILE_STREAM_DIR_ENTRY *stream_dentry = NULL;
+    EXFATFS_DENTRY_SET set;
+    EXFATFS_META_CONTENT *exfat_meta = NULL;
     uint32_t mode = 0;
-	TSK_INUM_T stream_inum;
-	TSK_INUM_T name_inum;
-	TSK_INUM_T prev_inum;
-    uint8_t name_bytes_written;
-	int name_index;
-	uint8_t bytes_to_copy;
-	FATFS_DENTRY temp_dentry;
-	char utf16_name[512];
+    uint8_t is_trusted = 0;
 
     assert(a_fatfs != NULL);
     assert(a_file_dentry != NULL);
@@ -1122,6 +1459,46 @@ exfatfs_copy_file_inode(FATFS_INFO *a_fatfs, TSK_INUM_T a_inum,
     fs = &(a_fatfs->fs_info);
     fs_meta = a_fs_file->meta;
 
+    /* Collect and verify the directory entry set. */
+    exfatfs_collect_dentry_set(a_fatfs, a_inum, a_file_dentry, a_is_alloc, &set);
+
+    /* Only a verified set may supply the file size, name, and time stamps.
+     * A set whose check sum does not match, that is missing entries, or that
+     * is not in order supplies none of them: the status and the entry
+     * addresses of the set are still recorded, but its unverified length,
+     * name, and times must not become part of a recovery result. A deleted
+     * set whose check sum verifies is recoverable and does supply them. */
+    is_trusted = (uint8_t)((set.status == EXFATFS_DENTRY_SET_STATUS_COMPLETE) ||
+        (set.status == EXFATFS_DENTRY_SET_STATUS_DELETED_RECOVERABLE));
+
+    if (tsk_verbose) {
+        tsk_fprintf(stderr,
+            "%s: File inode %" PRIuINUM " directory entry set (check sum stored 0x%04x, calculated 0x%04x): %s\n",
+            "exfatfs_copy_file_inode", a_inum, set.stored_check_sum,
+            set.calculated_check_sum, exfatfs_dentry_set_status_to_str(set.status));
+    }
+
+    /* Record the verification status and the entry addresses of the set in
+     * the exFAT part of the metadata content. */
+    if ((exfat_meta = exfatfs_meta_content(a_fs_file)) == NULL) {
+        return TSK_ERR;
+    }
+    exfat_meta->first_cluster = 0;
+    exfat_meta->dentry_set_status = set.status;
+    exfat_meta->primary_inum = set.primary_inum;
+    exfat_meta->stream_inum = set.stream_inum;
+    exfat_meta->first_name_inum = set.first_name_inum;
+    exfat_meta->last_inum = set.last_inum;
+    exfat_meta->stored_check_sum = set.stored_check_sum;
+    exfat_meta->calculated_check_sum = set.calculated_check_sum;
+    exfat_meta->declared_secondary_entry_count = set.stored_secondary_entry_count;
+    exfat_meta->actual_secondary_entry_count =
+        (uint8_t)((set.entries_count > 0) ? (set.entries_count - 1) : 0);
+    exfat_meta->declared_name_length_utf16_chars =
+        set.declared_name_length_utf16_chars;
+    exfat_meta->is_deleted = set.is_deleted;
+    exfat_meta->entries_count = set.entries_count;
+
     /* Determine whether the file is a regular file or directory. */
     if (file_dentry->attrs[0] & FATFS_ATTR_DIRECTORY) {
         fs_meta->type = TSK_FS_META_TYPE_DIR;
@@ -1131,7 +1508,7 @@ exfatfs_copy_file_inode(FATFS_INFO *a_fatfs, TSK_INUM_T a_inum,
     }
 
     /* Add mode flags corresponding to file attribute flags. */
-    mode = fs_meta->mode; 
+    mode = fs_meta->mode;
     if ((file_dentry->attrs[0] & FATFS_ATTR_READONLY) == 0) {
         mode |=
             (TSK_FS_META_MODE_IRUSR | TSK_FS_META_MODE_IRGRP |
@@ -1144,15 +1521,43 @@ exfatfs_copy_file_inode(FATFS_INFO *a_fatfs, TSK_INUM_T a_inum,
     }
     fs_meta->mode = (TSK_FS_META_MODE_ENUM)mode;
 
-    /* There is no notion of links in exFAT, just deleted or not deleted. 
+    /* There is no notion of links in exFAT, just deleted or not deleted.
      * If the file is not deleted, treat this as having one link. */
     fs_meta->nlink = (exfatfs_get_alloc_status_from_type(file_dentry->entry_type) == 0) ? 0 : 1;
+
+    /* Set the allocation status using both the allocation status of the
+     * sector that contains the directory entries and the entry type
+     * settings - essentially a "belt and suspenders" check. Only a set that
+     * is complete and verified - and not deleted - is reported as allocated;
+     * a set with a check sum mismatch, a broken sequence, or an unconfirmed
+     * source is reported as unallocated. */
+    if (a_is_alloc &&
+        (exfatfs_get_alloc_status_from_type(file_dentry->entry_type) == 1) &&
+        (set.status == EXFATFS_DENTRY_SET_STATUS_COMPLETE)) {
+        fs_meta->flags = TSK_FS_META_FLAG_ALLOC | TSK_FS_META_FLAG_USED;
+    }
+    else {
+        fs_meta->flags = TSK_FS_META_FLAG_UNALLOC;
+    }
+
+    /* Only a verified set carries trustworthy time stamps, a length, a name,
+     * and a data location. Everything else is left empty. */
+    if (!is_trusted || !set.stream_entry_is_present) {
+        if (tsk_verbose) {
+            tsk_fprintf(stderr,
+                "%s: Not reporting unverified length, name, or time stamps for inode %" PRIuINUM "\n",
+                "exfatfs_copy_file_inode", a_inum);
+        }
+        return TSK_OK;
+    }
+
+    stream_dentry = (EXFATFS_FILE_STREAM_DIR_ENTRY*)&set.entries[1];
 
     /* Copy the last modified time, converted to UNIX date format. */
     if (FATFS_ISDATE(tsk_getu16(fs->endian, file_dentry->modified_date))) {
         fs_meta->mtime =
             fatfs_dos_2_unix_time(tsk_getu16(fs->endian, file_dentry->modified_date),
-                tsk_getu16(fs->endian, file_dentry->modified_time), 
+                tsk_getu16(fs->endian, file_dentry->modified_time),
                 file_dentry->modified_time_tenths_of_sec);
         fs_meta->mtime_nano = fatfs_dos_2_nanosec(file_dentry->modified_time_tenths_of_sec);
     }
@@ -1164,7 +1569,7 @@ exfatfs_copy_file_inode(FATFS_INFO *a_fatfs, TSK_INUM_T a_inum,
     /* Copy the last accessed time, converted to UNIX date format. */
     if (FATFS_ISDATE(tsk_getu16(fs->endian, file_dentry->accessed_date))) {
         fs_meta->atime =
-            fatfs_dos_2_unix_time(tsk_getu16(fs->endian, file_dentry->accessed_date), 
+            fatfs_dos_2_unix_time(tsk_getu16(fs->endian, file_dentry->accessed_date),
                 tsk_getu16(fs->endian, file_dentry->accessed_time), 0);
     }
     else {
@@ -1180,7 +1585,7 @@ exfatfs_copy_file_inode(FATFS_INFO *a_fatfs, TSK_INUM_T a_inum,
     if (FATFS_ISDATE(tsk_getu16(fs->endian, file_dentry->created_date))) {
         fs_meta->crtime =
             fatfs_dos_2_unix_time(tsk_getu16(fs->endian, file_dentry->created_date),
-                tsk_getu16(fs->endian, file_dentry->created_time), 
+                tsk_getu16(fs->endian, file_dentry->created_time),
                 file_dentry->created_time_tenths_of_sec);
         fs_meta->crtime_nano = fatfs_dos_2_nanosec(file_dentry->created_time_tenths_of_sec);
     }
@@ -1189,78 +1594,61 @@ exfatfs_copy_file_inode(FATFS_INFO *a_fatfs, TSK_INUM_T a_inum,
         fs_meta->crtime_nano = 0;
     }
 
-    /* Attempt to load the file stream entry that goes with this file entry. 
-     * If not successful, at least the file entry meta data will be returned. */
-	if(exfatfs_next_dentry_inum(a_fatfs, a_inum, file_dentry, EXFATFS_DIR_ENTRY_TYPE_FILE_STREAM, &stream_inum)){
-		return TSK_OK;
-	}
-
-	if (exfatfs_load_file_stream_dentry(a_fatfs, stream_inum, a_is_alloc, 
-        file_dentry->entry_type, (FATFS_DENTRY *)(&stream_dentry)) ) {
-			return TSK_OK;
-	}
-
     /* Set the size of the file and the address of its first cluster. */
-    ((TSK_DADDR_T*)a_fs_file->meta->content_ptr)[0] = 
-        tsk_getu32(a_fatfs->fs_info.endian, stream_dentry.first_cluster_addr);
-    fs_meta->size = tsk_getu64(fs->endian, stream_dentry.data_length);
+    exfat_meta->first_cluster =
+        tsk_getu32(a_fatfs->fs_info.endian, stream_dentry->first_cluster_addr);
+    fs_meta->size = tsk_getu64(fs->endian, stream_dentry->data_length);
 
-    /* Set the allocation status using both the allocation status of the 
-     * sector that contains the directory entries and the entry type 
-     * settings - essentially a "belt and suspenders" check. */
-    if ((a_is_alloc) &&
-        (exfatfs_get_alloc_status_from_type(file_dentry->entry_type) == 1) &&
-        (exfatfs_get_alloc_status_from_type(stream_dentry.entry_type) == 1)) {
-        a_fs_file->meta->flags = TSK_FS_META_FLAG_ALLOC | TSK_FS_META_FLAG_USED;
+    /* If the FAT chain bit of the secondary flags of the stream entry is set,
+     * the file is not fragmented and there is no FAT chain to walk. If the
+     * file is not deleted, do an eager load instead of a lazy load of its
+     * data run. */
+    if ((fs_meta->flags & TSK_FS_META_FLAG_ALLOC) &&
+        (stream_dentry->flags & EXFATFS_INVALID_FAT_CHAIN_MASK) &&
+        (exfatfs_make_contiguous_data_run(a_fs_file))) {
+        return TSK_ERR;
+    }
 
-        /* If the FAT chain bit of the secondary flags of the stream entry is set,
-         * the file is not fragmented and there is no FAT chain to walk. If the 
-         * file is not deleted, do an eager load instead of a lazy load of its 
-         * data run. */
-        if ((stream_dentry.flags & EXFATFS_INVALID_FAT_CHAIN_MASK) &&
-            (exfatfs_make_contiguous_data_run(a_fs_file))) {
-            return TSK_ERR;
+    /* Assemble the file name from the file name entries of the set, using
+     * only the number of characters declared by the stream entry. */
+    if ((set.name_entries_count > 0) &&
+        (set.declared_name_length_utf16_chars > 0)) {
+        char utf16_name[(EXFATFS_MAX_FILE_NAME_LENGTH_UTF16_CHARS + 1) * 2];
+        size_t declared_name_bytes =
+            (size_t)set.declared_name_length_utf16_chars * 2;
+        size_t name_bytes_written = 0;
+        uint8_t name_index = 0;
+
+        if (declared_name_bytes > EXFATFS_MAX_FILE_NAME_LENGTH_UTF16_CHARS * 2) {
+            declared_name_bytes = EXFATFS_MAX_FILE_NAME_LENGTH_UTF16_CHARS * 2;
+        }
+
+        memset(utf16_name, 0, sizeof(utf16_name));
+
+        for (name_index = 0; name_index < set.name_entries_count; ++name_index) {
+            FATFS_DENTRY *name_dentry = &set.entries[2 + name_index];
+            size_t bytes_to_copy = EXFATFS_MAX_FILE_NAME_SEGMENT_LENGTH_UTF16_BYTES;
+
+            if (name_bytes_written >= declared_name_bytes) {
+                break;
+            }
+            if (bytes_to_copy > declared_name_bytes - name_bytes_written) {
+                bytes_to_copy = declared_name_bytes - name_bytes_written;
+            }
+            memcpy(utf16_name + name_bytes_written, &(name_dentry->data[2]),
+                bytes_to_copy);
+            name_bytes_written += bytes_to_copy;
+        }
+
+        if ((name_bytes_written > 0) &&
+            (fatfs_utf16_inode_str_2_utf8(a_fatfs, (UTF16*)utf16_name,
+                name_bytes_written / 2, (UTF8*)a_fs_file->meta->name2->name,
+                sizeof(a_fs_file->meta->name2->name), a_inum, "file name") != TSKconversionOK)) {
+            /* Keep the verified metadata, but do not report a name that could
+             * not be converted. */
+            a_fs_file->meta->name2->name[0] = '\0';
         }
     }
-    else {
-        a_fs_file->meta->flags = TSK_FS_META_FLAG_UNALLOC;
-    }
-
-	/* Attempt to load the file name entry(entries) that go with this file entry
-	 * First copy all UTF16 data into a single buffer
-	 * If not successful, return what we have to this point with no error */
-	memset(utf16_name, 0, sizeof(utf16_name));
-    name_bytes_written = 0;
-	prev_inum = stream_inum;
-	for(name_index = 1; name_index < file_dentry->secondary_entries_count;name_index++){
-		if(exfatfs_next_dentry_inum(a_fatfs, prev_inum, file_dentry, EXFATFS_DIR_ENTRY_TYPE_FILE_NAME, &name_inum)){
-			/* Try to save what we've got (if we found at least one file name dentry) */
-			if(name_index > 1){
-				if(fatfs_utf16_inode_str_2_utf8(a_fatfs, (UTF16 *)utf16_name, name_bytes_written / 2,
-					(UTF8*)a_fs_file->meta->name2->name, sizeof(a_fs_file->meta->name2->name), a_inum, "file name (partial)") != TSKconversionOK){
-						return TSK_OK; /* Don't want to disregard valid data read earlier */
-				}
-			}
-			return TSK_OK;
-		}
-		fatfs_dentry_load(a_fatfs, &temp_dentry, name_inum);
-		if(stream_dentry.file_name_length_UTF16_chars * 2 - name_bytes_written > EXFATFS_MAX_FILE_NAME_SEGMENT_LENGTH_UTF16_BYTES){
-            bytes_to_copy = EXFATFS_MAX_FILE_NAME_SEGMENT_LENGTH_UTF16_BYTES;
-		}
-		else{
-            bytes_to_copy = stream_dentry.file_name_length_UTF16_chars * 2 - name_bytes_written;
-		}
-        memcpy(utf16_name + name_bytes_written, &(temp_dentry.data[2]), bytes_to_copy);
-
-		prev_inum = name_inum;
-        name_bytes_written += bytes_to_copy;
-	}
-
-	/* Copy the file name segment. */
-	if(fatfs_utf16_inode_str_2_utf8(a_fatfs, (UTF16 *)utf16_name, name_bytes_written / 2,
-		(UTF8*)a_fs_file->meta->name2->name, sizeof(a_fs_file->meta->name2->name), a_inum, "file name") != TSKconversionOK){
-			return TSK_OK; /* Don't want to disregard valid data read earlier */
-	}
 
     return TSK_OK;
 }
@@ -1385,17 +1773,20 @@ exfatfs_inode_copy_init(FATFS_INFO *a_fatfs, TSK_INUM_T a_inum,
     }
     fs_meta->name2->name[0] = '\0';
 
-    /* Allocate space for saving the cluster address of the first cluster 
-     * of file inodes, including allocation bitmaps and upcase tables. */
-    if (fs_meta->content_len < FATFS_FILE_CONTENT_LEN) {
-        TSK_FS_META *tmp = tsk_fs_meta_realloc(fs_meta, FATFS_FILE_CONTENT_LEN);
+    /* Allocate space for saving the cluster address of the first cluster
+     * of file inodes, including allocation bitmaps and upcase tables, plus
+     * the exFAT-specific directory entry set information. */
+    if (fs_meta->content_len < EXFATFS_FILE_CONTENT_LEN) {
+        TSK_FS_META *tmp = tsk_fs_meta_realloc(fs_meta, EXFATFS_FILE_CONTENT_LEN);
         if (tmp == NULL) {
             free(fs_meta->name2);
             fs_meta->name2 = NULL;
             return 1;
         }
         fs_meta = tmp;
+        a_fs_file->meta = tmp;
     }
+    memset(fs_meta->content_ptr, 0, fs_meta->content_len);
 
     /* Mark the generic attribute list as not in use (in the generic file model
      * attributes are containers for data or metadata). Population of this 
@@ -1771,6 +2162,29 @@ exfatfs_istat_attr_flags(FATFS_INFO *a_fatfs, TSK_INUM_T a_inum,  FILE *a_hFile)
         }
 
         tsk_fprintf(a_hFile, "\n");
+
+        /* Report the verification status of the file directory entry set and
+         * the inode addresses of the entries that make it up. */
+        {
+            EXFATFS_DENTRY_SET set;
+            TSK_DADDR_T sector = FATFS_INODE_2_SECT(a_fatfs, a_inum);
+            int8_t sector_is_alloc = fatfs_is_sectalloc(a_fatfs, sector);
+
+            exfatfs_collect_dentry_set(a_fatfs, a_inum, (FATFS_DENTRY*)&dentry,
+                (uint8_t)(sector_is_alloc > 0), &set);
+
+            tsk_fprintf(a_hFile, "Entry Set Status: %s\n",
+                exfatfs_dentry_set_status_to_str(set.status));
+            tsk_fprintf(a_hFile, "Entry Set Check Sum: stored 0x%04x, calculated 0x%04x\n",
+                set.stored_check_sum, set.calculated_check_sum);
+            tsk_fprintf(a_hFile, "Entry Set Entries: primary %" PRIuINUM
+                ", stream %" PRIuINUM ", first name %" PRIuINUM
+                ", last %" PRIuINUM " (%u of %u secondary entries)\n",
+                set.primary_inum, set.stream_inum,
+                set.first_name_inum, set.last_inum,
+                (uint8_t)((set.entries_count > 0) ? set.entries_count - 1 : 0),
+                set.stored_secondary_entry_count);
+        }
 
         break;
     case EXFATFS_DIR_ENTRY_TYPE_FILE_STREAM:

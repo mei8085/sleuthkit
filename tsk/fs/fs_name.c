@@ -55,6 +55,11 @@ tsk_fs_name_alloc(size_t norm_namelen, size_t shrt_namelen)
     fs_name->name_size = norm_namelen;
 
     fs_name->flags = 0;
+    fs_name->fs_specific_flags = 0;
+    fs_name->fs_specific_meta_addr = 0;
+    fs_name->fs_specific_meta_addr2 = 0;
+    fs_name->fs_specific_count = 0;
+    memset(fs_name->reserved_fs_specific, 0, sizeof(fs_name->reserved_fs_specific));
 
     fs_name->shrt_name_size = shrt_namelen;
     if (shrt_namelen == 0) {
@@ -122,6 +127,10 @@ tsk_fs_name_reset(TSK_FS_NAME * a_fs_name)
     a_fs_name->par_seq = 0;
     a_fs_name->type = 0;
     a_fs_name->flags = 0;
+    a_fs_name->fs_specific_flags = 0;
+    a_fs_name->fs_specific_meta_addr = 0;
+    a_fs_name->fs_specific_meta_addr2 = 0;
+    a_fs_name->fs_specific_count = 0;
 }
 
 /**
@@ -210,6 +219,12 @@ tsk_fs_name_copy(TSK_FS_NAME * a_fs_name_to,
     a_fs_name_to->par_seq = a_fs_name_from->par_seq;
     a_fs_name_to->type = a_fs_name_from->type;
     a_fs_name_to->flags = a_fs_name_from->flags;
+    a_fs_name_to->fs_specific_flags = a_fs_name_from->fs_specific_flags;
+    a_fs_name_to->fs_specific_meta_addr = a_fs_name_from->fs_specific_meta_addr;
+    a_fs_name_to->fs_specific_meta_addr2 = a_fs_name_from->fs_specific_meta_addr2;
+    a_fs_name_to->fs_specific_count = a_fs_name_from->fs_specific_count;
+    memcpy(a_fs_name_to->reserved_fs_specific, a_fs_name_from->reserved_fs_specific,
+        sizeof(a_fs_name_to->reserved_fs_specific));
     a_fs_name_to->date_added = a_fs_name_from->date_added;
 
     return 0;
